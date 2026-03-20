@@ -1,64 +1,56 @@
-import os
-import nltk
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import Dict
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+import torch
 
-# --- CORREÇÃO DE AMBIENTE RENDER ---
-# Forçamos o NLTK a usar uma pasta local para evitar erros de permissão
-nltk_path = os.path.join(os.getcwd(), "nltk_data")
-os.makedirs(nltk_path, exist_ok=True)
-nltk.data.path.append(nltk_path)
+# 1. Configuração do Modelo e Tokenizer (Carregados globalmente para eficiência)
+model_name = "t5-small"
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
 
-# Downloads essenciais (adicionado 'stopwords' que o Sumy exige)
-nltk.download('punkt', download_dir=nltk_path, quiet=True)
-nltk.download('punkt_tab', download_dir=nltk_path, quiet=True)
-nltk.download('stopwords', download_dir=nltk_path, quiet=True)
+app = FastAPI(title="Summarization API com T5")
 
-# Importações após o setup do NLTK
-from sumy.parsers.plaintext import PlaintextParser
-from sumy.nlp.tokenizers import Tokenizer
-from sumy.summarizers.text_rank import TextRankSummarizer
-from sumy.utils import get_stop_words
-
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-class SummarizeRequest(BaseModel):
+# 2. Definição do esquema de dados de entrada
+class TextRequest(BaseModel):
     text: str
-    num_sentences: int = 3
-    language: str = "portuguese"
 
-@app.get("/")
-def home():
-    return {"status": "online", "docs": "/docs"}
-
+# 3. Endpoint de Resumo
 @app.post("/summarize")
-async def summarize_text(request: SummarizeRequest):
+async def summarize_text(request: TextRequest):
     if not request.text.strip():
-        return {"summary": "Texto vazio", "stats": {}}
+        raise HTTPException(status_code=400, detail="O texto não pode estar vazio.")
 
     try:
-        # Criamos o parser e o summarizer dentro do try para capturar o erro exato
-        parser = PlaintextParser.from_string(request.text, Tokenizer(request.language))
-        summarizer = TextRankSummarizer()
-        summarizer.stop_words = get_stop_words(request.language)
+        # Prepara o input com o prefixo do T5
+        input_text = "summarize: " + request.text
+        
+        # Tokenização
+        inputs = tokenizer.encode(
+            input_text, 
+            return_tensors="pt", 
+            max_length=512, 
+            truncation=True
+        )
 
-        resumo_frases = summarizer(parser.document, request.num_sentences)
-        resumo_texto = " ".join(str(frase).strip() for frase in resumo_frases)
+        # Geração do resumo
+        outputs = model.generate(
+            inputs,
+            max_length=150,
+            min_length=40,
+            length_penalty=1.0,
+            num_beams=4,
+            early_stopping=True
+        )
+
+        # Decodificação
+        summary = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
         return {
-            "summary": resumo_texto,
-            "original_len": len(request.text.split()),
-            "summary_len": len(resumo_texto.split())
+            "original_length": len(request.text),
+            "summary": summary,
+            "summary_length": len(summary)
         }
     except Exception as e:
-        # Se der erro 500, agora ele retornará o TEXTO do erro para sabermos o que é
-        return {"error": str(e), "type": str(type(e))}
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Para rodar: uvicorn nome_do_arquivo:app --reload
